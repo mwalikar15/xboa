@@ -3,7 +3,7 @@ import logging
 import json 
 import ee
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 from enum import Enum
 from dataclasses import dataclass
 from shapely.geometry import Polygon, box
@@ -609,3 +609,287 @@ def get_web_map_tile_pixels(s_comp: int,  tile_zoom:int = 0) -> int:
     tile_side_pixels = int(c_equator / (s_comp * (2** tile_zoom)))
     logger.info(f"pixels on one tile side: {tile_side_pixels}")
     return tile_side_pixels * tile_side_pixels
+
+
+
+def plot_geotiff_ndvi(
+    filepath: Union[str, Path],
+    save_png: bool = True,
+    show_plot: bool = True
+) -> Optional[Path]:
+    """
+    Public utility method to visualize and plot a GeoTIFF raster file.
+    Plots spatial NDVI heatmap with Lat/Lon extent axes and pixel value distribution histogram.
+    """
+    logger = logging.getLogger("main." + __name__)
+    target_path = Path(filepath)
+    if not target_path.exists() or not target_path.is_file():
+        raise FileNotFoundError(f"Target GeoTIFF raster missing: {target_path}")
+
+    try:
+        import rasterio
+        import matplotlib
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError as err:
+        logger.error(f"Plotting dependencies missing: {err}. Install via `pip install rasterio matplotlib numpy`.")
+        raise ImportError("Missing dependencies for plot_geotiff_ndvi: rasterio, matplotlib, numpy") from err
+
+    logger.info(f"Plotting raster: {target_path.name}")
+    with rasterio.open(target_path) as src:
+        ndvi_data = src.read(1)
+        bounds = src.bounds
+        extent = [bounds.left, bounds.right, bounds.bottom, bounds.top]
+
+        mask = src.dataset_mask()
+        ndvi_valid = np.where((mask > 0) & ~np.isnan(ndvi_data), ndvi_data, np.nan)
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), gridspec_kw={"width_ratios": [1.3, 1]})
+
+        try:
+            cmap = matplotlib.colormaps["RdYlGn"].copy()
+        except (AttributeError, KeyError):
+            cmap = plt.cm.get_cmap("RdYlGn")
+        cmap.set_bad(color="lightgray", alpha=0.5)
+
+        im = ax1.imshow(
+            ndvi_valid,
+            cmap=cmap,
+            extent=extent,
+            vmin=-0.2,
+            vmax=0.8,
+            origin="upper",
+        )
+
+        ax1.set_title(f"Sentinel-2 NDVI Heatmap\n{target_path.name}", fontsize=12, fontweight="bold")
+        ax1.set_xlabel("Longitude (°E)", fontsize=10)
+        ax1.set_ylabel("Latitude (°N)", fontsize=10)
+        ax1.grid(True, linestyle="--", alpha=0.5)
+
+        cbar = fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+        cbar.set_label("NDVI Index (Normalized Difference Vegetation Index)", fontsize=10)
+
+        valid_flat = ndvi_valid[~np.isnan(ndvi_valid)]
+        if valid_flat.size > 0:
+            counts, bins, patches = ax2.hist(
+                valid_flat, bins=50, range=(-0.2, 0.9), color="forestgreen", edgecolor="black", alpha=0.7
+            )
+
+            bin_centers = 0.5 * (bins[:-1] + bins[1:])
+            norm = plt.Normalize(-0.2, 0.8)
+            for c_patch, c_val in zip(patches, bin_centers):
+                c_patch.set_facecolor(cmap(norm(c_val)))
+
+            ax2.axvline(0.0, color="blue", linestyle=":", linewidth=1.5, label="Water threshold (0.0)")
+            ax2.axvline(0.2, color="orange", linestyle="--", linewidth=1.5, label="Bare soil (0.2)")
+            ax2.axvline(0.5, color="green", linestyle="-.", linewidth=1.5, label="Dense vegetation (0.5+)")
+
+            ax2.set_title("NDVI Pixel Value Distribution", fontsize=12, fontweight="bold")
+            ax2.set_xlabel("NDVI Value", fontsize=10)
+            ax2.set_ylabel("Pixel Count", fontsize=10)
+            ax2.grid(True, linestyle="--", alpha=0.5)
+            ax2.legend(loc="upper left", fontsize=9)
+        else:
+            ax2.text(0.5, 0.5, "No Valid Pixels", ha="center", va="center")
+
+        plt.tight_layout()
+
+        out_png = None
+        if save_png:
+            out_png = target_path.with_suffix(".png")
+            plt.savefig(out_png, dpi=200, bbox_inches="tight")
+            logger.info(f"Saved visualization PNG → {out_png}")
+
+        if show_plot:
+            plt.show()
+
+        return out_png
+
+
+
+def verify_geotiff_raster(
+    filepath: Union[str, Path]
+) -> dict[str, Any]:
+    """
+    Public utility method to inspect and verify a GeoTIFF raster file.
+    Validates file integrity, spatial dimensions, CRS, GeoTransform bounds,
+    valid pixel coverage percentage, and NDVI range [-1.0, +1.0].
+    """
+    logger = logging.getLogger("main." + __name__)
+    target_path = Path(filepath)
+    if not target_path.exists() or not target_path.is_file():
+        raise FileNotFoundError(f"Target GeoTIFF raster missing: {target_path}")
+
+    try:
+        import rasterio
+        import numpy as np
+        HAS_RASTERIO = True
+    except ImportError:
+        HAS_RASTERIO = False
+
+    try:
+        from osgeo import gdal
+        HAS_GDAL = True
+    except ImportError:
+        HAS_GDAL = False
+
+    if not HAS_RASTERIO and not HAS_GDAL:
+        raise ImportError("Neither 'rasterio' nor 'gdal' is installed. Install via `pip install rasterio`.")
+
+    logger.info(f"Verifying raster: {target_path.name}")
+
+    if HAS_RASTERIO:
+        with rasterio.open(target_path) as src:
+            band1 = src.read(1)
+            valid_mask = ~src.dataset_mask() == 0
+            valid_pixels = band1[valid_mask & ~np.isnan(band1)]
+
+            min_val = round(float(np.nanmin(valid_pixels)), 4) if valid_pixels.size > 0 else None
+            max_val = round(float(np.nanmax(valid_pixels)), 4) if valid_pixels.size > 0 else None
+            mean_val = round(float(np.nanmean(valid_pixels)), 4) if valid_pixels.size > 0 else None
+
+            is_valid_ndvi = (
+                min_val is not None
+                and max_val is not None
+                and -1.0 <= min_val <= 1.0
+                and -1.0 <= max_val <= 1.0
+                and valid_pixels.size > 0
+            )
+
+            stats = {
+                "file": target_path.name,
+                "file_size_kb": round(target_path.stat().st_size / 1024, 2),
+                "driver": src.driver,
+                "width": src.width,
+                "height": src.height,
+                "bands": src.count,
+                "crs": str(src.crs),
+                "dtype": str(src.dtypes[0]),
+                "bounds": {
+                    "left": round(src.bounds.left, 6),
+                    "bottom": round(src.bounds.bottom, 6),
+                    "right": round(src.bounds.right, 6),
+                    "top": round(src.bounds.top, 6),
+                },
+                "valid_pixel_count": int(valid_pixels.size),
+                "total_pixel_count": int(band1.size),
+                "valid_pixel_percentage": round(float(valid_pixels.size / band1.size * 100), 2) if band1.size > 0 else 0.0,
+                "min_val": min_val,
+                "max_val": max_val,
+                "mean_val": mean_val,
+                "is_valid_ndvi": is_valid_ndvi,
+            }
+            logger.info(f"Raster verification for {target_path.name}: NDVI valid={is_valid_ndvi}, bounds={stats['bounds']}, min={min_val}, max={max_val}")
+            return stats
+    else:
+        ds = gdal.Open(str(target_path))
+        band = ds.GetRasterBand(1)
+        g_stats = band.ComputeStatistics(False)
+        width, height = ds.RasterXSize, ds.RasterYSize
+        gt = ds.GetGeoTransform()
+        is_valid_ndvi = (-1.0 <= g_stats[0] <= 1.0) and (-1.0 <= g_stats[1] <= 1.0)
+
+        return {
+            "file": target_path.name,
+            "file_size_kb": round(target_path.stat().st_size / 1024, 2),
+            "width": width,
+            "height": height,
+            "bands": ds.RasterCount,
+            "crs": ds.GetProjectionRef()[:50] + "...",
+            "min_val": round(g_stats[0], 4),
+            "max_val": round(g_stats[1], 4),
+            "mean_val": round(g_stats[2], 4),
+            "bounds": {
+                "left": round(gt[0], 6),
+                "top": round(gt[3], 6),
+                "right": round(gt[0] + width * gt[1], 6),
+                "bottom": round(gt[3] + height * gt[5], 6),
+            },
+            "is_valid_ndvi": is_valid_ndvi,
+        }
+
+
+def compute_multiscale_raster_stats(
+    filepath: Union[str, Path],
+    target_scales_meters: Optional[list[int]] = None,
+    base_scale_meters: float = 10.0,
+    ndvi_threshold: float = 0.4,
+) -> dict[str, Any]:
+    """
+    Public SDK method: Computes multi-scale raster statistics 100% locally with 0 GEECU cost
+    and 0 GEE reprojection overhead.
+
+    Performs local spatial downsampling (e.g., 10m -> 30m -> 100m -> 250m -> 1000m) using rasterio block
+    averaging and calculates latitude-adjusted physical pixel areas (m² & hectares).
+    """
+    logger = logging.getLogger("main." + __name__)
+    target_path = Path(filepath)
+    if not target_path.exists() or not target_path.is_file():
+        raise FileNotFoundError(f"Target GeoTIFF raster missing: {target_path}")
+
+    if target_scales_meters is None:
+        target_scales_meters = [10, 30, 100, 250, 1000]
+
+    try:
+        import rasterio
+        from rasterio.enums import Resampling
+        import numpy as np
+    except ImportError as err:
+        logger.error(f"Missing rasterio/numpy dependencies: {err}")
+        raise ImportError("Missing dependencies for compute_multiscale_raster_stats: rasterio, numpy") from err
+
+    logger.info(f"Computing local multi-scale stats for {target_path.name} at scales: {target_scales_meters}")
+
+    scale_results = {}
+    with rasterio.open(target_path) as src:
+        bounds = src.bounds
+        center_lat = (bounds.bottom + bounds.top) / 2.0
+
+        for target_scale in target_scales_meters:
+            scale_factor = base_scale_meters / target_scale
+            out_width = max(1, int(src.width * scale_factor))
+            out_height = max(1, int(src.height * scale_factor))
+
+            # Resample band 1 using area-average for continuous NDVI data
+            data = src.read(
+                1,
+                out_shape=(out_height, out_width),
+                resampling=Resampling.average if scale_factor < 1.0 else Resampling.bilinear,
+            )
+
+            # Mask invalid / NoData pixels
+            mask = src.dataset_mask()
+            resampled_mask = src.read_masks(1, out_shape=(out_height, out_width))
+            valid_pixels = data[(resampled_mask > 0) & ~np.isnan(data)]
+
+            # Physical pixel area calculation adjusted for centroid latitude in EPSG:4326
+            pixel_deg_x = (bounds.right - bounds.left) / out_width
+            pixel_deg_y = (bounds.top - bounds.bottom) / out_height
+            meters_x = pixel_deg_x * 111350 * math.cos(math.radians(center_lat))
+            meters_y = pixel_deg_y * 111800
+            pixel_area_m2 = abs(meters_x * meters_y)
+
+            # Calculate healthy vegetation area above threshold
+            healthy_veg_pixels = valid_pixels[valid_pixels >= ndvi_threshold]
+            total_veg_area_m2 = healthy_veg_pixels.size * pixel_area_m2
+            total_veg_hectares = total_veg_area_m2 / 10000.0
+
+            scale_results[f"{target_scale}m"] = {
+                "target_scale_meters": target_scale,
+                "grid_dimensions": f"{out_width}x{out_height}",
+                "effective_pixel_area_m2": round(pixel_area_m2, 2),
+                "total_valid_pixels": int(valid_pixels.size),
+                "mean_ndvi": round(float(np.nanmean(valid_pixels)), 4) if valid_pixels.size > 0 else None,
+                "min_ndvi": round(float(np.nanmin(valid_pixels)), 4) if valid_pixels.size > 0 else None,
+                "max_ndvi": round(float(np.nanmax(valid_pixels)), 4) if valid_pixels.size > 0 else None,
+                "healthy_veg_pixel_count": int(healthy_veg_pixels.size),
+                "healthy_veg_area_hectares": round(total_veg_hectares, 2),
+            }
+
+    return {
+        "file": target_path.name,
+        "centroid_latitude": round(center_lat, 4),
+        "base_scale_meters": base_scale_meters,
+        "ndvi_threshold": ndvi_threshold,
+        "multiscale_statistics": scale_results,
+    }

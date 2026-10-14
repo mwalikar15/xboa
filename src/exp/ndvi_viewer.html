@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sentinel-2 NDVI Web Map Viewer | xboa</title>
+  
+  <!-- Modern Typography (Inter Font) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  
+  <style>
+    :root {
+      --bg-glass: rgba(15, 23, 42, 0.75);
+      --border-glass: rgba(255, 255, 255, 0.12);
+      --accent-color: #10b981;
+      --accent-hover: #059669;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body, html {
+      width: 100%;
+      height: 100%;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: #0f172a;
+      color: var(--text-main);
+      overflow: hidden;
+    }
+
+    /* Map Viewport */
+    #map {
+      width: 100vw;
+      height: 100vh;
+      z-index: 1;
+    }
+
+    /* Floating Glassmorphism Dashboard Panel */
+    .control-panel {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 1000;
+      width: 360px;
+      background: var(--bg-glass);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border-glass);
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+      transition: all 0.3s ease;
+    }
+
+    .header-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 20px;
+      color: var(--accent-color);
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+
+    .header-badge .pulse {
+      width: 8px;
+      height: 8px;
+      background-color: var(--accent-color);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--accent-color);
+      animation: pulse-glow 2s infinite;
+    }
+
+    @keyframes pulse-glow {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #ffffff;
+      margin-bottom: 6px;
+      letter-spacing: -0.02em;
+    }
+
+    p.subtitle {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+      line-height: 1.4;
+    }
+
+    .control-group {
+      margin-bottom: 18px;
+    }
+
+    .control-group label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.85rem;
+      font-weight: 500;
+      margin-bottom: 8px;
+      color: #e2e8f0;
+    }
+
+    .control-group label span.val {
+      font-family: monospace;
+      color: var(--accent-color);
+      font-size: 0.85rem;
+    }
+
+    /* Range Input Slider Styling */
+    input[type="range"] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 6px;
+      border-radius: 3px;
+      background: #334155;
+      outline: none;
+      transition: background 0.2s;
+    }
+
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--accent-color);
+      cursor: pointer;
+      box-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+      transition: transform 0.15s ease, background 0.15s ease;
+    }
+
+    input[type="range"]::-webkit-slider-thumb:hover {
+      transform: scale(1.15);
+      background: var(--accent-hover);
+    }
+
+    /* Select Inputs & Text Inputs */
+    select, input[type="text"] {
+      width: 100%;
+      padding: 10px 12px;
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid var(--border-glass);
+      border-radius: 8px;
+      color: #f1f5f9;
+      font-size: 0.85rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    select:focus, input[type="text"]:focus {
+      border-color: var(--accent-color);
+    }
+
+    /* Toggle Switch */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background: rgba(30, 41, 59, 0.5);
+      border-radius: 8px;
+      border: 1px solid var(--border-glass);
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 24px;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #475569;
+      transition: .3s;
+      border-radius: 24px;
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .3s;
+      border-radius: 50%;
+    }
+
+    input:checked + .slider {
+      background-color: var(--accent-color);
+    }
+
+    input:checked + .slider:before {
+      transform: translateX(20px);
+    }
+
+    /* NDVI Legend Card */
+    .legend-card {
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border-glass);
+    }
+
+    .legend-title {
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 10px;
+    }
+
+    .legend-bar {
+      height: 12px;
+      border-radius: 6px;
+      background: linear-gradient(to right, #a50026, #d73027, #f46d43, #fdae61, #fee08b, #d9ef8b, #a6d96a, #66bd63, #1a9850, #006837);
+      margin-bottom: 6px;
+      box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+    }
+
+    .legend-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    /* Footer Info Pill */
+    .info-footer {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      z-index: 1000;
+      background: var(--bg-glass);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-glass);
+      border-radius: 30px;
+      padding: 8px 16px;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.4);
+    }
+
+    .info-footer span strong {
+      color: #ffffff;
+    }
+
+    /* Leaflet Control Customization */
+    .leaflet-control-zoom a {
+      background: var(--bg-glass) !important;
+      color: white !important;
+      border-color: var(--border-glass) !important;
+      backdrop-filter: blur(8px);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Map Container -->
+  <div id="map"></div>
+
+  <!-- Control Panel Dashboard -->
+  <div class="control-panel">
+    <div class="header-badge">
+      <span class="pulse"></span>
+      <span>XYZ Raster Overlay</span>
+    </div>
+    <h1>NDVI Web Map</h1>
+    <p class="subtitle">Sentinel-2 Normalized Difference Vegetation Index (EPSG:3857 Tiles)</p>
+
+    <!-- Layer Toggle -->
+    <div class="control-group">
+      <div class="toggle-row">
+        <span style="font-size: 0.85rem; font-weight: 500;">Show NDVI Overlay</span>
+        <label class="switch">
+          <input type="checkbox" id="layerToggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Layer Opacity -->
+    <div class="control-group">
+      <label for="opacitySlider">
+        <span>Overlay Opacity</span>
+        <span class="val" id="opacityVal">85%</span>
+      </label>
+      <input type="range" id="opacitySlider" min="0" max="100" value="85">
+    </div>
+
+    <!-- Basemap Selector -->
+    <div class="control-group">
+      <label for="basemapSelect">Basemap Style</label>
+      <select id="basemapSelect">
+        <option value="dark">CartoDB Dark Matter (Recommended)</option>
+        <option value="satellite">Esri World Imagery (Satellite)</option>
+        <option value="osm">OpenStreetMap Standard</option>
+      </select>
+    </div>
+
+    <!-- Tile Source URL Template -->
+    <div class="control-group">
+      <label for="tileUrlInput">Tile Source Template</label>
+      <input type="text" id="tileUrlInput" value="/tiles/{z}/{x}/{y}.png">
+    </div>
+
+    <!-- Legend Card -->
+    <div class="legend-card">
+      <div class="legend-title">NDVI Index Palette</div>
+      <div class="legend-bar"></div>
+      <div class="legend-labels">
+        <span>-0.2 (Water/Bare)</span>
+        <span>0.3 (Sparse)</span>
+        <span>+0.8 (Dense Veg)</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Status Footer -->
+  <div class="info-footer">
+    <span>Zoom: <strong id="zoomDisplay">--</strong></span>
+    <span>Lat/Lon: <strong id="coordsDisplay">--</strong></span>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  
+  <script>
+    // Tile bounds helper: converts (x, y, z) tile indices to [lat, lon]
+    function tile2lon(x, z) {
+      return (x / Math.pow(2, z)) * 360 - 180;
+    }
+    function tile2lat(y, z) {
+      const n = Math.PI - (2 * Math.PI * y) / Math.pow(2, z);
+      return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+    }
+
+    // Extent for downloaded AOI (Zoom 12: X[3015..3016], Y[1746]) in output/rasters/EPSG-3857
+    const defaultBounds = L.latLngBounds(
+      [tile2lat(1747, 12), tile2lon(3015, 12)], // South-West (lat_min, lon_min)
+      [tile2lat(1746, 12), tile2lon(3017, 12)]  // North-East (lat_max, lon_max)
+    );
+
+    // 1. Basemap Tile Providers
+    const basemaps = {
+      dark: L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+        subdomains: 'abcd',
+        maxZoom: 20
+      }),
+      satellite: L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+        maxZoom: 19
+      }),
+      osm: L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19
+      })
+    };
+
+    // 2. Initialize Leaflet Map automatically centered on tile bounds
+    const map = L.map('map', {
+      layers: [basemaps.dark],
+      zoomControl: false
+    });
+
+    // Fit map view directly to generated tile bounding box
+    map.fitBounds(defaultBounds, { padding: [40, 40] });
+
+    // Custom top-right zoom control
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    // Determine initial tile URL path based on environment
+    let initialTileUrl = '/tiles/{z}/{x}/{y}.png';
+    if (window.location.protocol === 'file:') {
+      initialTileUrl = 'http://127.0.0.1:8000/tiles/{z}/{x}/{y}.png';
+    }
+    document.getElementById('tileUrlInput').value = initialTileUrl;
+
+    // 3. Create Custom XYZ Tile Layer Overlay
+    let ndviTileLayer = L.tileLayer(initialTileUrl, {
+      minZoom: 0,
+      maxZoom: 20,
+      opacity: 0.85,
+      bounds: defaultBounds
+    }).addTo(map);
+
+    // 4. UI Interactivity Handlers
+    const opacitySlider = document.getElementById('opacitySlider');
+    const opacityVal = document.getElementById('opacityVal');
+    const layerToggle = document.getElementById('layerToggle');
+    const basemapSelect = document.getElementById('basemapSelect');
+    const tileUrlInput = document.getElementById('tileUrlInput');
+    const zoomDisplay = document.getElementById('zoomDisplay');
+    const coordsDisplay = document.getElementById('coordsDisplay');
+
+    // Opacity Control
+    opacitySlider.addEventListener('input', (e) => {
+      const opacity = e.target.value / 100;
+      opacityVal.textContent = `${e.target.value}%`;
+      ndviTileLayer.setOpacity(opacity);
+    });
+
+    // Layer Toggle Switch
+    layerToggle.addEventListener('change', (e) => {
+      if (e.target.checked) {
+        ndviTileLayer.addTo(map);
+      } else {
+        map.removeLayer(ndviTileLayer);
+      }
+    });
+
+    // Basemap Switcher
+    basemapSelect.addEventListener('change', (e) => {
+      const selected = e.target.value;
+      Object.values(basemaps).forEach(layer => map.removeLayer(layer));
+      basemaps[selected].addTo(map);
+    });
+
+    // Dynamic Tile Source URL Update
+    tileUrlInput.addEventListener('change', (e) => {
+      const newUrl = e.target.value;
+      map.removeLayer(ndviTileLayer);
+      ndviTileLayer = L.tileLayer(newUrl, {
+        minZoom: 0,
+        maxZoom: 20,
+        opacity: opacitySlider.value / 100,
+        bounds: defaultBounds
+      }).addTo(map);
+    });
+
+    // Coordinate & Zoom Tracking
+    map.on('move', () => {
+      const center = map.getCenter();
+      coordsDisplay.textContent = `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`;
+      zoomDisplay.textContent = map.getZoom();
+    });
+
+    // Initialize displays
+    zoomDisplay.textContent = map.getZoom();
+    const initialCenter = map.getCenter();
+    coordsDisplay.textContent = `${initialCenter.lat.toFixed(4)}, ${initialCenter.lng.toFixed(4)}`;
+
+  </script>
+</body>
+</html>

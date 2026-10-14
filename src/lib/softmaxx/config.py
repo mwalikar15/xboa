@@ -68,6 +68,44 @@ class LoggerConfig:
     log_file: str
     log_level: int
 
+
+@dataclass(frozen=True)
+class GeeConfig:
+    credentials_file: str
+
+    @property
+    def project(self) -> str:
+        """Derives the GCP project ID from the credentials file."""
+        return self.get_credentials_dict().get("project_id", "")
+
+    def get_credentials_dict(self) -> Dict[str, Any]:
+        """
+        Reads and returns the service-account credentials from the JSON file
+        referenced by ``credentials_file``.  The private_key newline escaping
+        is normalised automatically.
+        """
+        creds_path = Path(self.credentials_file).resolve()
+        if not creds_path.exists():
+            raise FileNotFoundError(
+                f"GEE credentials file not found: {creds_path}"
+            )
+        with open(creds_path, "r") as fh:
+            creds: Dict[str, Any] = json.load(fh)
+        if "private_key" in creds and isinstance(creds["private_key"], str):
+            creds["private_key"] = creds["private_key"].replace("\\n", "\n")
+        return creds
+
+    @property
+    def service_account_email(self) -> str:
+        """Derives the service-account e-mail from the credentials file."""
+        return self.get_credentials_dict().get("client_email", "")
+
+    def get_credentials_json(self) -> str:
+        """Returns credentials serialized as a JSON string."""
+        return json.dumps(self.get_credentials_dict())
+
+
+
 # ==============================================================================
 # 2. INTERNAL PATH LOCATOR
 # ==============================================================================
@@ -294,3 +332,17 @@ def get_logger_config(name: str) -> LoggerConfig:
         log_file=str(data["log_file"]),
         log_level=int(data["log_level"])
     )
+
+
+@lru_cache(maxsize=16)
+def get_gee_config() -> GeeConfig:
+    """
+    Extracts Google Earth Engine (GEE) credentials-file path from AppConfig.
+    The GCP project ID and service-account e-mail are loaded lazily from the
+    referenced credentials JSON file. Cached.
+    """
+    gee_section = AppConfig.get("gee")
+    return GeeConfig(
+        credentials_file=str(gee_section["credentials_file"]),
+    )
+

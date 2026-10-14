@@ -1,10 +1,101 @@
-# Byte-compiled / optimized / DLL files
+# ==============================================================================
+# Python — byte-compiled / optimized / cache
+# ==============================================================================
 __pycache__/
 *.py[codz]
 *$py.class
+*.pyo
 
 # C extensions
 *.so
 
-# visual studio 
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# ==============================================================================
+# Virtual environments
+# ==============================================================================
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# ==============================================================================
+# Project-specific runtime output
+# ==============================================================================
+# Downloaded raster tiles and GeoTIFFs produced by geo scripts / exp tools
+output/
+
+# Temporary / scratch files
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# ==============================================================================
+# Credentials & secrets  ← never commit these
+# ==============================================================================
+# Service-account JSON keys (GEE and other Google Cloud credentials)
+*-credentials.json
+*-key.json
+*service_account*.json
+# Catch the specific naming pattern used in this project (e.g. project-keyid.json)
+# but NOT config.json which is intentionally committed as a template
+*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*.json
+.env.local
+.env.*.local
+secrets/
+
+# ==============================================================================
+# Logs
+# ==============================================================================
+*.log
+logs/
+
+# ==============================================================================
+# IDE & editors
+# ==============================================================================
+# VS Code (workspace settings are intentionally excluded — add back selectively)
 .vscode/
+# JetBrains (PyCharm, IntelliJ, etc.)
+.idea/
+*.iml
+# Vim / Neovim
+*.swp
+*.swo
+# Emacs
+*~
+\#*\#
+
+# ==============================================================================
+# OS metadata
+# ==============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==============================================================================
+# Jupyter notebooks — checkpoints only (keep .ipynb files)
+# ==============================================================================
+.ipynb_checkpoints/
+
+# ==============================================================================
+# Testing & coverage
+# ==============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
