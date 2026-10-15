@@ -394,14 +394,14 @@
       })
     };
 
-    // 2. Initialize Leaflet Map automatically centered on tile bounds
+    // 2. Initialize Leaflet Map (centered generally until /info bounds load)
+    let currentBounds = null;
     const map = L.map('map', {
       layers: [basemaps.dark],
+      center: [10.0, 76.3],
+      zoom: 12,
       zoomControl: false
     });
-
-    // Fit map view directly to generated tile bounding box
-    map.fitBounds(defaultBounds, { padding: [40, 40] });
 
     // Custom top-right zoom control
     L.control.zoom({ position: 'topright' }).addTo(map);
@@ -413,12 +413,11 @@
     }
     document.getElementById('tileUrlInput').value = initialTileUrl;
 
-    // 3. Create Custom XYZ Tile Layer Overlay
+    // 3. Create Custom XYZ Tile Layer Overlay (unconstrained initially)
     let ndviTileLayer = L.tileLayer(initialTileUrl, {
       minZoom: 0,
       maxZoom: 20,
-      opacity: 0.85,
-      bounds: defaultBounds
+      opacity: 0.85
     }).addTo(map);
 
     // 4. UI Interactivity Handlers
@@ -457,12 +456,15 @@
     tileUrlInput.addEventListener('change', (e) => {
       const newUrl = e.target.value;
       map.removeLayer(ndviTileLayer);
-      ndviTileLayer = L.tileLayer(newUrl, {
+      const opts = {
         minZoom: 0,
         maxZoom: 20,
-        opacity: opacitySlider.value / 100,
-        bounds: defaultBounds
-      }).addTo(map);
+        opacity: opacitySlider.value / 100
+      };
+      if (currentBounds) {
+        opts.bounds = currentBounds;
+      }
+      ndviTileLayer = L.tileLayer(newUrl, opts).addTo(map);
     });
 
     // Coordinate & Zoom Tracking
@@ -476,6 +478,35 @@
     zoomDisplay.textContent = map.getZoom();
     const initialCenter = map.getCenter();
     coordsDisplay.textContent = `${initialCenter.lat.toFixed(4)}, ${initialCenter.lng.toFixed(4)}`;
+
+    // 5. Dynamic Metadata Auto-Configuration from TiTiler /info
+    const infoEndpoint = window.location.protocol === 'file:' 
+      ? 'http://127.0.0.1:8000/info' 
+      : '/info';
+
+    fetch(infoEndpoint)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(info => {
+        if (info.bounds_wgs84 && Array.isArray(info.bounds_wgs84) && info.bounds_wgs84.length === 4) {
+          const [minLon, minLat, maxLon, maxLat] = info.bounds_wgs84;
+          currentBounds = L.latLngBounds([minLat, minLon], [maxLat, maxLon]);
+          map.fitBounds(currentBounds, { padding: [40, 40] });
+          ndviTileLayer.options.bounds = currentBounds;
+          ndviTileLayer.redraw();
+        }
+        if (info.native_zoom && info.s_comp_meters) {
+          const subtitle = document.querySelector('p.subtitle');
+          if (subtitle) {
+            subtitle.innerHTML = `Dataset: <code>${info.dataset_id}</code> (${info.s_comp_meters}m) &bull; Native Z${info.native_zoom} &bull; ${info.total_rasters} rasters (${info.storage_type})`;
+          }
+        }
+      })
+      .catch(err => {
+        console.warn('Could not auto-fetch /info metadata, using defaults:', err);
+      });
 
   </script>
 </body>

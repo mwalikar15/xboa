@@ -1,261 +1,373 @@
 """
-Dynamic On-The-Fly Web Map Tile Server (Approach B)
-====================================================
-Demonstrates streaming Web Mercator (EPSG:3857) XYZ PNG tiles on-the-fly from local GeoTIFF rasters
-using the Core SDK (`softmaxx.config`, `softmaxx.geo.tiles`) and Python's built-in `http.server`.
+TiTiler Production Dynamic COG Tile Server
+===========================================
+Production-ready ASGI tile server powered by TiTiler (titiler.core + rio-tiler),
+FastAPI, and Uvicorn.
 
-- 0 disk overhead for pre-rendered PNG tiles
-- On-the-fly windowed raster extraction & colormap rendering
-- Full CORS support for Leaflet / Mapbox / OpenLayers web clients
+Key Capabilities:
+-----------------
+1. TiTiler Core Integration:
+   - Mounts TiTiler's official TilerFactory under /cog (info, stats, tiles, tilejson).
+   - Serves any COG via URL parameter (local path or s3:// URI).
+
+2. Seamless Multi-Raster Mosaic Serving:
+   - Serves the entire raster collection under /tiles/{z}/{x}/{y}.png.
+   - Powered by rio-tiler's multi-source mosaic_reader with dynamic overview selection.
+   - Currently serves from local directory; seamlessly switches to Amazon S3 (s3://...)
+     by changing the storage path.
+
+3. Performance & Standards:
+   - Sub-millisecond palette colormapping with rio-tiler.
+   - Async non-blocking execution via asyncio.to_thread.
+   - In-memory thread-safe LRU caching with MD5 ETags (HTTP 304 Not Modified).
+   - Full CORS and standard Cache-Control headers.
+
+Usage:
+------
+    # Serve COGs from local directory (default: output/rasters/EPSG-3857)
+    python src/exp/tile_server.py
+
+    # Serve on all interfaces
+    python src/exp/tile_server.py --host 0.0.0.0 --port 8000
+
+    # Seamlessly point to Amazon S3 (when ready)
+    python src/exp/tile_server.py --storage-path s3://my-gee-bucket/rasters/EPSG-3857
 """
 
-import io
-import math
-import logging
-from pathlib import Path
-from typing import Optional, Tuple, List
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-import urllib.parse
+import os
+# Ensure matplotlib does not write to non-writable directories
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
-import numpy as np
-import rasterio
-from rasterio.warp import reproject, Resampling
-from rasterio.transform import from_bounds
-from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+import logging
+import argparse
+from pathlib import Path
+from typing import Optional, Union
+
+import uvicorn
+from fastapi import FastAPI, Request, Response, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 from softmaxx.config import AppConfig, get_logger_config
-import softmaxx.geo.tiles as geo_tiles
+from softmaxx.geo.titiler_engine import (
+    TiTilerEngine,
+    DEFAULT_CMAP,
+    DEFAULT_VMIN,
+    DEFAULT_VMAX,
+    SUPPORTED_CMAPS,
+)
 
 logger = logging.getLogger("main." + __name__)
 
-MAX_EXTENT = 20037508.342789244
-INITIAL_RESOLUTION = MAX_EXTENT * 2.0
 
-
-def get_tile_bounds_epsg3857(x: int, y: int, z: int) -> Tuple[float, float, float, float]:
-    """Returns (min_x, min_y, max_x, max_y) in EPSG:3857 meters for tile (x, y, z)."""
-    tiles_per_axis = 2 ** z
-    tile_size_meters = INITIAL_RESOLUTION / tiles_per_axis
-
-    min_x = -MAX_EXTENT + (x * tile_size_meters)
-    max_x = min_x + tile_size_meters
-
-    max_y = MAX_EXTENT - (y * tile_size_meters)
-    min_y = max_y - tile_size_meters
-
-    return min_x, min_y, max_x, max_y
-
-
-class DynamicTileRenderer:
+def create_titiler_app(
+    storage_path: Union[str, Path],
+    dataset_id: str = "COPERNICUS/S2_SR_HARMONIZED",
+    cache_size: int = 512,
+    default_cmap: str = DEFAULT_CMAP,
+    viewer_html_path: Optional[Path] = None,
+) -> FastAPI:
     """
-    On-the-fly raster renderer that extracts requested Web Mercator (EPSG:3857) tile windows
-    from local GeoTIFF files and converts them to RGBA PNG image bytes.
+    Constructs the production FastAPI application with TiTiler routers.
     """
-    def __init__(self, raster_files: List[Path], cmap_name: str = "RdYlGn", vmin: float = -0.2, vmax: float = 0.8):
-        self.raster_files = raster_files
-        self.cmap_name = cmap_name
-        self.vmin = vmin
-        self.vmax = vmax
+    engine = TiTilerEngine(
+        storage_path=storage_path,
+        dataset_id=dataset_id,
+        cache_size=cache_size,
+        default_cmap=default_cmap,
+    )
+    meta = engine.metadata
+
+    app = FastAPI(
+        title="TiTiler Dynamic COG Tile Server",
+        description="Production dynamic tile server using titiler.core and rio-tiler",
+        version="2.4.0",
+    )
+
+    # Enable CORS for Leaflet, MapLibre, OpenLayers web clients
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["GET", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    # 1. Mount official TiTiler COG router under /cog
+    app.include_router(
+        engine.tiler_factory.router,
+        prefix="/cog",
+        tags=["Cloud Optimized GeoTIFF (TiTiler)"],
+    )
+
+    # Store engine on app.state
+    app.state.engine = engine
+
+    # Resolve HTML viewer
+    if viewer_html_path is None or not viewer_html_path.exists():
+        repo_root = Path(__file__).resolve().parents[2]
+        viewer_html_path = repo_root / "src" / "exp" / "ndvi_viewer.html"
+
+    cached_html = viewer_html_path.read_text(encoding="utf-8") if viewer_html_path.exists() else None
+
+    # --------------------------------------------------------------------------
+    # Viewer Endpoints
+    # --------------------------------------------------------------------------
+
+    @app.get("/", response_class=HTMLResponse)
+    @app.get("/viewer", response_class=HTMLResponse)
+    @app.get("/ndvi_viewer.html", response_class=HTMLResponse)
+    async def serve_viewer():
+        if viewer_html_path and viewer_html_path.exists():
+            html_content = viewer_html_path.read_text(encoding="utf-8")
+        elif cached_html is not None:
+            html_content = cached_html
+        else:
+            raise HTTPException(status_code=404, detail="HTML viewer not found on disk.")
+        return HTMLResponse(
+            content=html_content,
+            status_code=200,
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    # --------------------------------------------------------------------------
+    # Health & Metadata Endpoints
+    # --------------------------------------------------------------------------
+
+    @app.get("/health")
+    async def health_check():
+        return {
+            "status": "ok",
+            "titiler_version": "2.4.0",
+            "storage_type": meta.storage_type,
+            "storage_path": meta.storage_path,
+            "dataset_id": meta.dataset_id,
+            "s_comp_meters": meta.s_comp_meters,
+            "native_zoom": meta.native_zoom,
+            "display_match_zoom": meta.display_match_zoom,
+            "rasters_indexed": meta.total_rasters,
+            "cache": engine.cache.stats(),
+        }
+
+    @app.get("/info")
+    async def tile_info(request: Request):
+        base_url = str(request.base_url).rstrip("/")
+        return {
+            "engine": "TiTiler (titiler.core + rio-tiler)",
+            "storage_type": meta.storage_type,
+            "storage_path": meta.storage_path,
+            "dataset_id": meta.dataset_id,
+            "s_comp_meters": meta.s_comp_meters,
+            "native_zoom": meta.native_zoom,
+            "display_match_zoom": meta.display_match_zoom,
+            "min_zoom": meta.min_zoom,
+            "max_zoom": meta.max_zoom,
+            "tile_size_px": meta.tile_size_px,
+            "total_rasters": meta.total_rasters,
+            "bounds_3857": meta.bounds_3857,
+            "bounds_wgs84": meta.bounds_wgs84,
+            "ndvi_range": meta.ndvi_range,
+            "supported_cmaps": meta.supported_cmaps,
+            "cache": engine.cache.stats(),
+            "endpoints": {
+                "viewer": f"{base_url}/",
+                "health": f"{base_url}/health",
+                "info": f"{base_url}/info",
+                "tile_template": f"{base_url}/tiles/{{z}}/{{x}}/{{y}}.png",
+                "titiler_cog": f"{base_url}/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?url=...",
+            },
+        }
+
+    # --------------------------------------------------------------------------
+    # Seamless Multi-Raster Dynamic XYZ Tile Endpoint
+    # --------------------------------------------------------------------------
+
+    @app.get("/tiles/{z}/{x}/{y}.png")
+    @app.get("/boa/v1/tiles/{z}/{x}/{y}.png")
+    async def render_tile(
+        z: int,
+        x: int,
+        y: int,
+        request: Request,
+        cmap: str = Query(DEFAULT_CMAP, description="rio-tiler colormap name"),
+        vmin: float = Query(DEFAULT_VMIN, description="Lower NDVI bound"),
+        vmax: float = Query(DEFAULT_VMAX, description="Upper NDVI bound"),
+    ):
+        # Validate coordinates
+        max_idx = 1 << z
+        if z < 0 or z > 24 or x < 0 or x >= max_idx or y < 0 or y >= max_idx:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tile coordinate ({z}/{x}/{y}) out of range [0..{max_idx - 1}].",
+            )
+
+        cmap_clean = cmap.lower()
+        if cmap_clean not in SUPPORTED_CMAPS:
+            cmap_clean = DEFAULT_CMAP
 
         try:
-            self.colormap = plt.colormaps[cmap_name]
-        except (AttributeError, KeyError):
-            self.colormap = cm.get_cmap(cmap_name)
+            result = await engine.render_tile_async(
+                x=x, y=y, z=z, cmap_name=cmap_clean, vmin=vmin, vmax=vmax
+            )
+        except Exception as err:
+            logger.exception(f"Unhandled render error at {z}/{x}/{y}: {err}")
+            raise HTTPException(status_code=500, detail="Internal tile rendering error")
 
-    def render_tile(self, x: int, y: int, z: int, tile_size: int = 256) -> Optional[bytes]:
-        t_min_x, t_min_y, t_max_x, t_max_y = get_tile_bounds_epsg3857(x, y, z)
-        tile_transform = from_bounds(t_min_x, t_min_y, t_max_x, t_max_y, tile_size, tile_size)
+        if result is None:
+            # 204 No Content for empty / non-intersecting tiles
+            return Response(
+                status_code=204,
+                headers={
+                    "Cache-Control": "public, max-age=300",
+                    "Access-Control-Allow-Origin": "*",
+                },
+            )
 
-        combined_rgba = np.zeros((tile_size, tile_size, 4), dtype=np.uint8)
-        has_pixels = False
+        png_bytes, etag = result
 
-        for tif_path in self.raster_files:
-            try:
-                with rasterio.open(tif_path) as src:
-                    src_crs = src.crs or "EPSG:3857"
-                    dst_data = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+        # Check HTTP ETag for 304 Not Modified
+        if_none_match = request.headers.get("if-none-match")
+        if if_none_match and if_none_match.strip('"') == etag:
+            return Response(status_code=304)
 
-                    reproject(
-                        source=rasterio.band(src, 1),
-                        destination=dst_data,
-                        src_transform=src.transform,
-                        src_crs=src_crs,
-                        dst_transform=tile_transform,
-                        dst_crs="EPSG:3857",
-                        resampling=Resampling.bilinear,
-                        src_nodata=src.nodata,
-                        dst_nodata=np.nan
-                    )
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers={
+                "ETag": f'"{etag}"',
+                "Cache-Control": "public, max-age=3600",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
 
-                    if np.all(np.isnan(dst_data)):
-                        continue
-
-                    valid_mask = ~np.isnan(dst_data)
-                    if src.nodata is not None:
-                        valid_mask = valid_mask & (dst_data != src.nodata)
-
-                    if not np.any(valid_mask):
-                        continue
-
-                    # Apply NDVI colormap
-                    norm_data = np.clip((dst_data - self.vmin) / (self.vmax - self.vmin), 0.0, 1.0)
-                    rgba_float = self.colormap(norm_data)
-                    rgba_uint8 = (rgba_float * 255).astype(np.uint8)
-                    rgba_uint8[~valid_mask, 3] = 0
-
-                    # Blend non-transparent pixels onto accumulator
-                    new_pixels = rgba_uint8[:, :, 3] > 0
-                    combined_rgba[new_pixels] = rgba_uint8[new_pixels]
-                    has_pixels = True
-
-            except Exception as err:
-                logger.error(f"Error reading raster {tif_path}: {err}")
-
-        if not has_pixels:
-            return None
-
-        # Encode to PNG stream
-        img = Image.fromarray(combined_rgba, mode="RGBA")
-        buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
-        return buffer.getvalue()
+    return app
 
 
-class TileRequestHandler(BaseHTTPRequestHandler):
-    """
-    HTTP request handler supporting dynamic tile requests (/tiles/{z}/{x}/{y}.png)
-    and serving the Leaflet Web Map Viewer.
-    """
-    renderer: Optional[DynamicTileRenderer] = None
-    html_viewer_path: Optional[Path] = None
-
-    def log_message(self, format, *args):
-        logger.info("%s - - [%s] %s" % (self.client_address[0], self.log_date_time_string(), format % args))
-
-    def _send_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self._send_cors_headers()
-        self.end_headers()
-
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-
-        # Serve Web Map Viewer HTML at root or /viewer
-        if path in ("/", "/viewer", "/ndvi_viewer.html"):
-            if self.html_viewer_path and self.html_viewer_path.exists():
-                content = self.html_viewer_path.read_bytes()
-                self.send_response(200)
-                self._send_cors_headers()
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(content)))
-                self.end_headers()
-                self.wfile.write(content)
-                return
-            else:
-                self.send_error(404, "HTML viewer template missing")
-                return
-
-        # Handle Tile Requests: /tiles/{z}/{x}/{y}.png
-        if path.startswith("/tiles/") and (path.endswith(".png") or path.endswith(".webp")):
-            parts = path.strip("/").split("/")
-            if len(parts) == 4 and parts[0] == "tiles":
-                try:
-                    z = int(parts[1])
-                    x = int(parts[2])
-                    y_str = parts[3].split(".")[0]
-                    y = int(y_str)
-
-                    png_bytes = self.renderer.render_tile(x, y, z) if self.renderer else None
-
-                    if png_bytes:
-                        self.send_response(200)
-                        self._send_cors_headers()
-                        self.send_header("Content-Type", "image/png")
-                        self.send_header("Cache-Control", "public, max-age=3600")
-                        self.send_header("Content-Length", str(len(png_bytes)))
-                        self.end_headers()
-                        self.wfile.write(png_bytes)
-                        return
-                    else:
-                        # Return transparent 204 No Content for empty tile
-                        self.send_response(204)
-                        self._send_cors_headers()
-                        self.end_headers()
-                        return
-                except ValueError:
-                    pass
-
-        self.send_error(404, "Resource Not Found")
-
-
-def run_tile_server(host: str = "127.0.0.1", port: int = 8000, raster_dir: Optional[Path] = None):
-    # 1. Load application config
+def run_tile_server(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    storage_path: Optional[Union[str, Path]] = None,
+    dataset_id: str = "COPERNICUS/S2_SR_HARMONIZED",
+    cache_size: int = 512,
+    default_cmap: str = DEFAULT_CMAP,
+) -> None:
+    """Bootstrap and run the TiTiler Uvicorn ASGI server."""
     AppConfig.load()
     try:
-        log_config = get_logger_config("local")
-        AppConfig.init_logging(log_file=log_config.log_file, log_level=log_config.log_level)
+        lc = get_logger_config("local")
+        AppConfig.init_logging(log_file=lc.log_file, log_level=lc.log_level)
     except Exception:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        )
 
     repo_root = Path(__file__).resolve().parents[2]
 
-    # Resolve target raster directory
-    if raster_dir is None:
-        possible_dirs = [
-            repo_root / "output" / "rasters" / "EPSG-3857"
+    # Discover default local raster directory if not provided
+    if storage_path is None:
+        candidates = [
+            repo_root / "output" / "rasters" / "EPSG-3857",
         ]
-        for p in possible_dirs:
-            if p.exists() and list(p.glob("*.tif")):
-                raster_dir = p
+        for c in candidates:
+            if c.is_dir() and (list(c.glob("*.tif")) or list(c.glob("*.tiff"))):
+                storage_path = c
                 break
 
-    if not raster_dir or not raster_dir.exists():
-        raise FileNotFoundError("No GeoTIFF raster output directory found. Run ndvi_downloader.py first.")
+    if not storage_path:
+        raise FileNotFoundError(
+            "No GeoTIFF raster directory found. "
+            "Run ndvi_downloader.py first, or pass --storage-path explicitly."
+        )
 
-    tif_files = sorted(list(raster_dir.glob("*.tif")) + list(raster_dir.glob("*.tiff")))
-    logger.info(f"Loaded {len(tif_files)} GeoTIFF file(s) from {raster_dir}")
-    for tif in tif_files:
-        logger.info(f"  - {tif.name}")
+    app = create_titiler_app(
+        storage_path=storage_path,
+        dataset_id=dataset_id,
+        cache_size=cache_size,
+        default_cmap=default_cmap,
+    )
+    meta = app.state.engine.metadata
 
-    # Instantiate tile renderer and handler
-    TileRequestHandler.renderer = DynamicTileRenderer(tif_files)
-    TileRequestHandler.html_viewer_path = repo_root / "src" / "exp" / "ndvi_viewer.html"
+    base_url = f"http://{host}:{port}"
+    logger.info("=" * 75)
+    logger.info("  🚀 TITILER DYNAMIC COG TILE SERVER (titiler.core + rio-tiler)")
+    logger.info(f"  Base URL              : {base_url}")
+    logger.info(f"  Web Map Viewer        : {base_url}/")
+    logger.info(f"  Health Check          : {base_url}/health")
+    logger.info(f"  Tile Metadata (/info) : {base_url}/info")
+    logger.info(f"  Seamless Tile Layer   : {base_url}/tiles/{{z}}/{{x}}/{{y}}.png")
+    logger.info(f"  TiTiler COG Endpoint  : {base_url}/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?url=...")
+    logger.info("-" * 75)
+    logger.info(f"  Storage Backend       : {meta.storage_type.upper()} ({meta.storage_path})")
+    logger.info(f"  GEE Dataset ID        : {meta.dataset_id}")
+    logger.info(f"  Native Res (s_comp)   : {meta.s_comp_meters} m/pixel (Dynamic from GEE)")
+    logger.info(f"  Container Native Zoom : Z={meta.native_zoom} (from calculate_web_map_tile_zoom)")
+    logger.info(f"  Display Zoom (1:1)    : Z={meta.display_match_zoom} (from calculate_display_match_zoom)")
+    logger.info(f"  Supported Zoom Range  : Z=[{meta.min_zoom} .. {meta.max_zoom}]")
+    logger.info(f"  Indexed Rasters       : {meta.total_rasters} GeoTIFF(s)")
+    logger.info(f"  LRU Cache Size        : {cache_size} tiles")
+    logger.info("=" * 75)
 
-    class ReusableThreadingServer(ThreadingHTTPServer):
-        allow_reuse_address = True
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=False,
+    )
 
-    httpd = None
-    target_port = port
-    for p in range(port, port + 10):
-        try:
-            httpd = ReusableThreadingServer((host, p), TileRequestHandler)
-            target_port = p
-            break
-        except OSError:
-            continue
 
-    if httpd is None:
-        raise OSError(f"Could not bind tile server to any port in range {port}-{port+9}")
-
-    logger.info(f"=== Dynamic Tile Server running at http://{host}:{target_port} ===")
-    logger.info(f"Tile Template endpoint: http://{host}:{target_port}/tiles/{{z}}/{{x}}/{{y}}.png")
-    logger.info(f"Web Map Viewer page   : http://{host}:{target_port}/")
-
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down tile server.")
-        httpd.server_close()
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="TiTiler Dynamic COG Tile Server (Local Directory or S3)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address. Use 0.0.0.0 to expose on all interfaces (e.g. Docker).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="TCP port to listen on.",
+    )
+    parser.add_argument(
+        "--storage-path",
+        "--raster-dir",
+        dest="storage_path",
+        default=None,
+        help="Directory containing EPSG:3857 GeoTIFF rasters, or an S3 URI (s3://bucket/prefix).",
+    )
+    parser.add_argument(
+        "--dataset-id",
+        type=str,
+        default="COPERNICUS/S2_SR_HARMONIZED",
+        help="GEE Dataset ID used to dynamically resolve native resolution.",
+    )
+    parser.add_argument(
+        "--cache-size",
+        type=int,
+        default=512,
+        help="Maximum number of rendered PNG tiles held in LRU memory cache.",
+    )
+    parser.add_argument(
+        "--cmap",
+        default=DEFAULT_CMAP,
+        choices=SUPPORTED_CMAPS,
+        help="Default NDVI colormap name.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run_tile_server()
-
+    args = _parse_args()
+    run_tile_server(
+        host=args.host,
+        port=args.port,
+        storage_path=args.storage_path,
+        dataset_id=args.dataset_id,
+        cache_size=args.cache_size,
+        default_cmap=args.cmap,
+    )

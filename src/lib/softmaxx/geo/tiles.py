@@ -893,3 +893,129 @@ def compute_multiscale_raster_stats(
         "ndvi_threshold": ndvi_threshold,
         "multiscale_statistics": scale_results,
     }
+
+
+# ==============================================================================
+# WEB MAP TILE SERVER MATHEMATICS & DYNAMIC RESOLUTION HELPERS
+# ==============================================================================
+
+MAX_EXTENT_3857: float = 20037508.342789244
+INITIAL_RESOLUTION_3857: float = MAX_EXTENT_3857 * 2.0
+
+
+def tile_bounds_3857(x: int, y: int, z: int) -> tuple[float, float, float, float]:
+    """
+    Returns (min_x, min_y, max_x, max_y) in EPSG:3857 metres for tile (x, y, z).
+    Standard Web Mercator (XYZ/TMS):
+      - Origin is top-left (NW corner).
+      - X increases East, Y increases South.
+    """
+    n = 1 << z
+    tile_m = INITIAL_RESOLUTION_3857 / n
+    min_x = -MAX_EXTENT_3857 + x * tile_m
+    max_x = min_x + tile_m
+    max_y = MAX_EXTENT_3857 - y * tile_m
+    min_y = max_y - tile_m
+    return min_x, min_y, max_x, max_y
+
+
+def tile_bounds_wgs84(x: int, y: int, z: int) -> tuple[float, float, float, float]:
+    """
+    Returns (min_lon, min_lat, max_lon, max_lat) in WGS-84 degrees for tile (x, y, z).
+    """
+    n = 1 << z
+    min_lon = x / n * 360.0 - 180.0
+    max_lon = (x + 1) / n * 360.0 - 180.0
+
+    max_lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
+    min_lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n)))
+    min_lat = math.degrees(min_lat_rad)
+    max_lat = math.degrees(max_lat_rad)
+    return min_lon, min_lat, max_lon, max_lat
+
+
+def bounds_to_tile(bounds_3857: tuple[float, float, float, float], zoom: int) -> tuple[int, int]:
+    """
+    Converts an EPSG:3857 bounding box center to tile coordinates (x, y) at zoom level z.
+    """
+    n = 1 << zoom
+    tile_m = INITIAL_RESOLUTION_3857 / n
+    cx = (bounds_3857[0] + bounds_3857[2]) / 2.0
+    cy = (bounds_3857[1] + bounds_3857[3]) / 2.0
+    x = int(math.floor((cx + MAX_EXTENT_3857) / tile_m))
+    y = int(math.floor((MAX_EXTENT_3857 - cy) / tile_m))
+    return x, y
+
+
+def calculate_display_match_zoom(
+    s_comp: float,
+    latitude: float = 0.0,
+    tile_size: int = 256,
+) -> int:
+    """
+    Calculates the Web Map zoom level where 1 screen/display pixel matches
+    the native data resolution (s_comp in meters per pixel).
+    """
+    cos_lat = math.cos(math.radians(latitude))
+    if cos_lat <= 0:
+        raise ValueError(f"Invalid latitude: {latitude}")
+
+    c_equator = INITIAL_RESOLUTION_3857
+    z_float = math.log2((c_equator * cos_lat) / (s_comp * tile_size))
+    return max(0, min(24, round(z_float)))
+
+
+def web_map_pixel_resolution(
+    zoom: int,
+    latitude: float = 0.0,
+    tile_size: int = 256,
+) -> float:
+    """
+    Returns the ground resolution in meters per display pixel for a given zoom level
+    and latitude on the Web Mercator projection.
+    """
+    cos_lat = math.cos(math.radians(latitude))
+    c_equator = INITIAL_RESOLUTION_3857
+    return (c_equator * cos_lat) / ((1 << zoom) * tile_size)
+
+
+def get_parent_tile(x: int, y: int, z: int, parent_z: int) -> tuple[int, int, int]:
+    """
+    Finds the parent tile coordinate (parent_x, parent_y, parent_z) for tile (x, y, z)
+    at an ancestor zoom level (parent_z <= z) via integer bit shifts.
+    """
+    if parent_z > z:
+        raise ValueError(f"parent_z ({parent_z}) must be <= z ({z})")
+    delta = z - parent_z
+    return x >> delta, y >> delta, parent_z
+
+
+def get_child_tile_range(
+    x: int, y: int, z: int, child_z: int
+) -> tuple[int, int, int, int]:
+    """
+    Returns (min_child_x, max_child_x, min_child_y, max_child_y) covering parent
+    tile (x, y, z) at descendant zoom level (child_z >= z). Note that max_* is exclusive.
+    """
+    if child_z < z:
+        raise ValueError(f"child_z ({child_z}) must be >= z ({z})")
+    delta = child_z - z
+    scale = 1 << delta
+    min_child_x = x << delta
+    min_child_y = y << delta
+    return min_child_x, min_child_x + scale, min_child_y, min_child_y + scale
+
+
+def tiles_intersect(
+    bounds1: tuple[float, float, float, float],
+    bounds2: tuple[float, float, float, float],
+) -> bool:
+    """
+    Returns True if two (min_x, min_y, max_x, max_y) bounding boxes overlap.
+    """
+    return not (
+        bounds1[2] <= bounds2[0]
+        or bounds1[0] >= bounds2[2]
+        or bounds1[3] <= bounds2[1]
+        or bounds1[1] >= bounds2[3]
+    )

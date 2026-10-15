@@ -228,3 +228,66 @@ def download_ndvi_tile(
     url = get_image_download_url(ndvi_img, region, name=tile_name, scale=scale, crs=crs)
     return download_raster_geotiff(url, output_path)
 
+
+# ==============================================================================
+# 5. DATASET METADATA & RESOLUTION QUERIES
+# ==============================================================================
+
+KNOWN_GEE_DATASET_RESOLUTIONS = {
+    "COPERNICUS/S2_SR_HARMONIZED": {
+        "B2": 10.0, "B3": 10.0, "B4": 10.0, "B8": 10.0,
+        "B5": 20.0, "B6": 20.0, "B7": 20.0, "B8A": 20.0, "B11": 20.0, "B12": 20.0,
+        "B1": 60.0, "B9": 60.0,
+        "default": 10.0,
+    },
+    "COPERNICUS/S2_HARMONIZED": {
+        "B2": 10.0, "B3": 10.0, "B4": 10.0, "B8": 10.0, "default": 10.0
+    },
+    "COPERNICUS/S2_SR": {
+        "B2": 10.0, "B3": 10.0, "B4": 10.0, "B8": 10.0, "default": 10.0
+    },
+    "LANDSAT/LC08/C02/T1_L2": {
+        "SR_B2": 30.0, "SR_B3": 30.0, "SR_B4": 30.0, "SR_B5": 30.0, "default": 30.0
+    },
+    "LANDSAT/LC09/C02/T1_L2": {
+        "SR_B2": 30.0, "SR_B3": 30.0, "SR_B4": 30.0, "SR_B5": 30.0, "default": 30.0
+    },
+    "MODIS/006/MOD09GA": {
+        "sur_refl_b01": 250.0, "sur_refl_b02": 250.0, "default": 250.0
+    },
+}
+
+
+def get_gee_dataset_resolution(
+    dataset_id: str = "COPERNICUS/S2_SR_HARMONIZED",
+    band: str = "B4",
+) -> float:
+    """
+    Retrieves the native spatial resolution (meters per pixel) for a given GEE dataset and band.
+    Attempts GEE API nominalScale() query, with fallback to known remote sensing catalog.
+    """
+    try:
+        if not (getattr(ee.data, "_credentials", None) or getattr(ee.data, "_auth_app", None)):
+            init_gee()
+
+        image = ee.Image(dataset_id)
+        scale = image.select(band).projection().nominalScale().getInfo()
+        if scale and isinstance(scale, (int, float)) and scale > 0:
+            logger.info(f"Retrieved native resolution from GEE for {dataset_id} band {band}: {scale}m")
+            return float(scale)
+    except Exception as gee_err:
+        logger.debug(f"Could not query GEE API for nominalScale ({gee_err}); falling back to catalog.")
+
+    ds_upper = dataset_id.strip()
+    for known_id, band_map in KNOWN_GEE_DATASET_RESOLUTIONS.items():
+        if known_id in ds_upper or ds_upper in known_id:
+            res = band_map.get(band, band_map.get("default", 10.0))
+            logger.info(f"Resolved native resolution from catalog for {dataset_id} ({band}): {res}m")
+            return float(res)
+
+    default_res = 10.0
+    logger.warning(
+        f"Unknown GEE dataset '{dataset_id}'. Defaulting native computation resolution to {default_res}m."
+    )
+    return default_res
+

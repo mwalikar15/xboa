@@ -7,6 +7,7 @@ and `softmaxx.geo.tiles`).
 """
 
 import logging
+import argparse
 from pathlib import Path
 
 from softmaxx.config import AppConfig, get_logger_config
@@ -93,7 +94,45 @@ def download_epsg3857_tiles(polygon_file: Path, output_dir: Path, date_start: st
 
 
 def main():
-    # 1. Load application configuration & initialize logging via Core SDK
+    # 1. Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Download Sentinel-2 NDVI GeoTIFF tiles in EPSG:3857 and/or EPSG:4326 projections."
+    )
+    parser.add_argument(
+        "--crs",
+        type=str,
+        default="both",
+        choices=["EPSG:3857", "EPSG:4326", "both", "3857", "4326"],
+        help="Target CRS to download (choices: EPSG:3857, EPSG:4326, both; default: both).",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default="2024-01-01",
+        help="Observation start date (YYYY-MM-DD; default: 2024-01-01).",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default="2024-03-31",
+        help="Observation end date (YYYY-MM-DD; default: 2024-03-31).",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=10.0,
+        help="Spatial resolution scale in meters (default: 10.0).",
+    )
+    args = parser.parse_args()
+
+    # Normalize CRS choice
+    crs_target = args.crs.upper()
+    if crs_target == "3857":
+        crs_target = "EPSG:3857"
+    elif crs_target == "4326":
+        crs_target = "EPSG:4326"
+
+    # 2. Load application configuration & initialize logging via Core SDK
     AppConfig.load()
     try:
         log_config = get_logger_config("local")
@@ -102,10 +141,11 @@ def main():
         # Fallback logging if "local" logger section is omitted in config
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 
+    logger.info(f"Target download projection: {crs_target}")
     logger.info("Initializing Google Earth Engine via Core SDK...")
     gee_provider.init_gee()
 
-    # 2. Setup Paths & Parameters
+    # 3. Setup Paths & Parameters
     repo_root = Path(__file__).resolve().parents[2]
     polygon_file = repo_root / "scripts" / "geo" / "polygon.json"
 
@@ -113,29 +153,31 @@ def main():
     output_dir_4326 = repo_root / "output" / "rasters" / "EPSG-4326"
     output_dir_3857 = repo_root / "output" / "rasters" / "EPSG-3857"
 
-    date_start = "2024-01-01"
-    date_end = "2024-03-31"
-    scale_meters = 10.0
+    # 4. Download rasters conditionally based on target CRS
+    if crs_target in ("EPSG:4326", "BOTH"):
+        download_epsg4326_tiles(
+            polygon_file=polygon_file,
+            output_dir=output_dir_4326,
+            date_start=args.start_date,
+            date_end=args.end_date,
+            scale_meters=args.scale,
+        )
 
-    # 3. Download rasters in EPSG:4326
-    download_epsg4326_tiles(
-        polygon_file=polygon_file,
-        output_dir=output_dir_4326,
-        date_start=date_start,
-        date_end=date_end,
-        scale_meters=scale_meters,
-    )
+    if crs_target in ("EPSG:3857", "BOTH"):
+        download_epsg3857_tiles(
+            polygon_file=polygon_file,
+            output_dir=output_dir_3857,
+            date_start=args.start_date,
+            date_end=args.end_date,
+            scale_meters=args.scale,
+        )
 
-    # 4. Download rasters in EPSG:3857
-    download_epsg3857_tiles(
-        polygon_file=polygon_file,
-        output_dir=output_dir_3857,
-        date_start=date_start,
-        date_end=date_end,
-        scale_meters=scale_meters,
-    )
-
-    logger.info(f"All tile downloads complete.\nEPSG:4326 -> {output_dir_4326}\nEPSG:3857 -> {output_dir_3857}")
+    if crs_target == "BOTH":
+        logger.info(f"All tile downloads complete.\nEPSG:4326 -> {output_dir_4326}\nEPSG:3857 -> {output_dir_3857}")
+    elif crs_target == "EPSG:3857":
+        logger.info(f"EPSG:3857 tile downloads complete -> {output_dir_3857}")
+    else:
+        logger.info(f"EPSG:4326 tile downloads complete -> {output_dir_4326}")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from softmaxx.config import get_logger_config
 from .routers.llm import llm_router
 from .routers.game import game_router
 from .routers.hello import hello_router
+from .routers.tiles import tiles_router, cog_router
 
 
 # noinspection PyUnusedLocal
@@ -35,4 +36,6 @@ main_router = APIRouter(prefix="/boa/v1")
 main_router.include_router(hello_router)
 main_router.include_router(llm_router)
 main_router.include_router(game_router)
+main_router.include_router(tiles_router)
+main_router.include_router(cog_router, prefix="/cog", tags=["TiTiler COG"])
 app.include_router(main_router)
