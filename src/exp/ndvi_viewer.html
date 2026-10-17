@@ -315,6 +315,28 @@
       </div>
     </div>
 
+    <!-- AOI Polygon Clipping Toggle -->
+    <div class="control-group">
+      <div class="toggle-row">
+        <span style="font-size: 0.85rem; font-weight: 500;">Clip Raster to AOI</span>
+        <label class="switch">
+          <input type="checkbox" id="clipToggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- AOI Boundary Line Toggle -->
+    <div class="control-group">
+      <div class="toggle-row">
+        <span style="font-size: 0.85rem; font-weight: 500;">Show AOI Boundary</span>
+        <label class="switch">
+          <input type="checkbox" id="aoiToggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+
     <!-- Layer Opacity -->
     <div class="control-group">
       <label for="opacitySlider">
@@ -406,6 +428,106 @@
     // Custom top-right zoom control
     L.control.zoom({ position: 'topright' }).addTo(map);
 
+    // --------------------------------------------------------------------------
+    // 3. Setup Custom Tile Pane & SVG ClipPath for AOI Clipping
+    // --------------------------------------------------------------------------
+    // Dedicated pane for NDVI tiles (z-index 350: above basemap 200, below vector overlays 400)
+    map.createPane('ndviPane');
+    const ndviPane = map.getPane('ndviPane');
+    ndviPane.style.zIndex = 350;
+
+    // SVG container for the vector clipPath
+    const svgNS = "http://www.w3.org/2000/svg";
+    const clipSvg = document.createElementNS(svgNS, "svg");
+    clipSvg.setAttribute("id", "aoiClipSvg");
+    clipSvg.setAttribute("style", "position: absolute; width: 0; height: 0; pointer-events: none;");
+
+    const defs = document.createElementNS(svgNS, "defs");
+    const clipPath = document.createElementNS(svgNS, "clipPath");
+    clipPath.setAttribute("id", "aoiClip");
+    clipPath.setAttribute("clipPathUnits", "userSpaceOnUse");
+
+    const clipPolygon = document.createElementNS(svgNS, "polygon");
+    clipPolygon.setAttribute("id", "aoiClipPoly");
+    clipPolygon.setAttribute("points", "");
+
+    clipPath.appendChild(clipPolygon);
+    defs.appendChild(clipPath);
+    clipSvg.appendChild(defs);
+    map.getContainer().appendChild(clipSvg);
+
+    // Apply SVG clipPath to the ndviPane
+    let isClipActive = true;
+    ndviPane.style.clipPath = 'url(#aoiClip)';
+    ndviPane.style.webkitClipPath = 'url(#aoiClip)';
+
+    // 4. Default Fallback AOI Polygon (scripts/geo/polygon.json)
+    let aoiPolygon = {
+      "type": "Polygon",
+      "coordinates": [
+        [
+          [76.1173, 9.7962],
+          [76.4173, 9.7962],
+          [76.4173, 10.0662],
+          [76.1173, 10.0662],
+          [76.1173, 9.7962]
+        ]
+      ]
+    };
+    let aoiCoords = aoiPolygon.coordinates[0];
+
+    // AOI Vector Layer for visual boundary display
+    let aoiVectorLayer = L.geoJSON(aoiPolygon, {
+      style: {
+        color: '#10b981',
+        weight: 2,
+        opacity: 0.9,
+        dashArray: '6, 6',
+        fillColor: '#10b981',
+        fillOpacity: 0.05
+      }
+    }).addTo(map);
+
+    // Converts geographic coordinates [lon, lat] into layer pixel points on the tile pane
+    function updateClipPath() {
+      if (!clipPolygon || !aoiCoords) return;
+      if (!isClipActive) {
+        ndviPane.style.clipPath = 'none';
+        ndviPane.style.webkitClipPath = 'none';
+        return;
+      }
+      ndviPane.style.clipPath = 'url(#aoiClip)';
+      ndviPane.style.webkitClipPath = 'url(#aoiClip)';
+
+      const pointsStr = aoiCoords.map(coord => {
+        // coord format: [lon, lat] -> Leaflet uses [lat, lon]
+        const pt = map.latLngToLayerPoint([coord[1], coord[0]]);
+        return `${pt.x.toFixed(1)},${pt.y.toFixed(1)}`;
+      }).join(' ');
+
+      clipPolygon.setAttribute('points', pointsStr);
+    }
+
+    // Recalculate SVG clip-path dynamically across all map transforms
+    map.on('move', updateClipPath);
+    map.on('zoom', updateClipPath);
+    map.on('viewreset', updateClipPath);
+    map.on('resize', updateClipPath);
+
+    // Point-in-polygon helper for inspection clicks
+    function isPointInAOI(lon, lat) {
+      if (!aoiCoords || aoiCoords.length < 3) return true;
+      let inside = false;
+      for (let i = 0, j = aoiCoords.length - 1; i < aoiCoords.length; j = i++) {
+        const xi = aoiCoords[i][0], yi = aoiCoords[i][1];
+        const xj = aoiCoords[j][0], yj = aoiCoords[j][1];
+        const intersect = ((yi > lat) !== (yj > lat)) &&
+            (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    }
+
     // Determine initial tile URL path based on environment
     let initialTileUrl = '/tiles/{z}/{x}/{y}.png';
     if (window.location.protocol === 'file:') {
@@ -413,17 +535,29 @@
     }
     document.getElementById('tileUrlInput').value = initialTileUrl;
 
-    // 3. Create Custom XYZ Tile Layer Overlay (unconstrained initially)
-    let ndviTileLayer = L.tileLayer(initialTileUrl, {
-      minZoom: 0,
-      maxZoom: 20,
-      opacity: 0.85
-    }).addTo(map);
+    // Helper to create tile layer inside ndviPane
+    function createNdviLayer(url) {
+      const opts = {
+        pane: 'ndviPane',
+        minZoom: 0,
+        maxZoom: 20,
+        opacity: document.getElementById('opacitySlider').value / 100
+      };
+      if (currentBounds) {
+        opts.bounds = currentBounds;
+      }
+      return L.tileLayer(url, opts);
+    }
 
-    // 4. UI Interactivity Handlers
+    // 5. Create Custom XYZ Tile Layer Overlay inside the clipped pane
+    let ndviTileLayer = createNdviLayer(initialTileUrl).addTo(map);
+
+    // 6. UI Interactivity Handlers
     const opacitySlider = document.getElementById('opacitySlider');
     const opacityVal = document.getElementById('opacityVal');
     const layerToggle = document.getElementById('layerToggle');
+    const clipToggle = document.getElementById('clipToggle');
+    const aoiToggle = document.getElementById('aoiToggle');
     const basemapSelect = document.getElementById('basemapSelect');
     const tileUrlInput = document.getElementById('tileUrlInput');
     const zoomDisplay = document.getElementById('zoomDisplay');
@@ -445,6 +579,21 @@
       }
     });
 
+    // AOI Clip Toggle Switch
+    clipToggle.addEventListener('change', (e) => {
+      isClipActive = e.target.checked;
+      updateClipPath();
+    });
+
+    // AOI Boundary Vector Toggle Switch
+    aoiToggle.addEventListener('change', (e) => {
+      if (e.target.checked) {
+        map.addLayer(aoiVectorLayer);
+      } else {
+        map.removeLayer(aoiVectorLayer);
+      }
+    });
+
     // Basemap Switcher
     basemapSelect.addEventListener('change', (e) => {
       const selected = e.target.value;
@@ -456,15 +605,7 @@
     tileUrlInput.addEventListener('change', (e) => {
       const newUrl = e.target.value;
       map.removeLayer(ndviTileLayer);
-      const opts = {
-        minZoom: 0,
-        maxZoom: 20,
-        opacity: opacitySlider.value / 100
-      };
-      if (currentBounds) {
-        opts.bounds = currentBounds;
-      }
-      ndviTileLayer = L.tileLayer(newUrl, opts).addTo(map);
+      ndviTileLayer = createNdviLayer(newUrl).addTo(map);
     });
 
     // Coordinate & Zoom Tracking
@@ -479,11 +620,48 @@
     const initialCenter = map.getCenter();
     coordsDisplay.textContent = `${initialCenter.lat.toFixed(4)}, ${initialCenter.lng.toFixed(4)}`;
 
-    // 5. Dynamic Metadata Auto-Configuration from TiTiler /info
+    // 7. Dynamic Metadata Auto-Configuration from TiTiler /info & /aoi
     const infoEndpoint = window.location.protocol === 'file:' 
       ? 'http://127.0.0.1:8000/info' 
       : '/info';
+    const aoiEndpoint = window.location.protocol === 'file:'
+      ? 'http://127.0.0.1:8000/aoi'
+      : '/aoi';
 
+    // Fetch dynamic AOI polygon
+    fetch(aoiEndpoint)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(data => {
+        if (data && data.coordinates && data.coordinates[0]) {
+          aoiPolygon = data;
+          aoiCoords = data.coordinates[0];
+          map.removeLayer(aoiVectorLayer);
+          aoiVectorLayer = L.geoJSON(aoiPolygon, {
+            style: {
+              color: '#10b981',
+              weight: 2,
+              opacity: 0.9,
+              dashArray: '6, 6',
+              fillColor: '#10b981',
+              fillOpacity: 0.05
+            }
+          });
+          if (aoiToggle.checked) {
+            aoiVectorLayer.addTo(map);
+          }
+          updateClipPath();
+          map.fitBounds(aoiVectorLayer.getBounds(), { padding: [40, 40] });
+        }
+      })
+      .catch(err => {
+        console.warn('Using embedded fallback AOI polygon:', err);
+        updateClipPath();
+      });
+
+    // Fetch /info metadata
     fetch(infoEndpoint)
       .then(res => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -493,7 +671,6 @@
         if (info.bounds_wgs84 && Array.isArray(info.bounds_wgs84) && info.bounds_wgs84.length === 4) {
           const [minLon, minLat, maxLon, maxLat] = info.bounds_wgs84;
           currentBounds = L.latLngBounds([minLat, minLon], [maxLat, maxLon]);
-          map.fitBounds(currentBounds, { padding: [40, 40] });
           ndviTileLayer.options.bounds = currentBounds;
           ndviTileLayer.redraw();
         }
@@ -507,6 +684,98 @@
       .catch(err => {
         console.warn('Could not auto-fetch /info metadata, using defaults:', err);
       });
+
+    // 8. Interactive Point Inspection (Queries EPSG:4326 Computation Raster)
+    const inspectionPopup = L.popup({ minWidth: 200, className: 'ndvi-inspect-popup' });
+
+    map.on('click', async (e) => {
+      const lat = e.latlng.lat;
+      const lon = e.latlng.lng;
+
+      // If clipping is active and click is outside AOI, inform user
+      if (isClipActive && !isPointInAOI(lon, lat)) {
+        inspectionPopup
+          .setLatLng(e.latlng)
+          .setContent(`
+            <div style="font-family: 'Inter', sans-serif; padding: 6px; color: #0f172a;">
+              <div style="font-size: 0.85rem; font-weight: 700; color: #f59e0b; margin-bottom: 4px;">Outside AOI Polygon</div>
+              <div style="font-size: 0.75rem; color: #64748b; margin-bottom: 6px;">The raster overlay is clipped to the target AOI boundary.</div>
+              <div style="font-size: 0.72rem; color: #94a3b8;">Lat: ${lat.toFixed(5)}, Lon: ${lon.toFixed(5)}</div>
+            </div>
+          `)
+          .openOn(map);
+        return;
+      }
+
+      inspectionPopup
+        .setLatLng(e.latlng)
+        .setContent(`
+          <div style="font-family: 'Inter', sans-serif; padding: 4px; color: #0f172a;">
+            <div style="font-size: 0.75rem; color: #64748b; font-weight: 600;">Sampling EPSG:4326...</div>
+            <div style="font-size: 0.8rem; color: #334155; margin-top: 4px;">Lat: ${lat.toFixed(5)}, Lon: ${lon.toFixed(5)}</div>
+          </div>
+        `)
+        .openOn(map);
+
+      const basePointUrl = window.location.protocol === 'file:' 
+        ? 'http://127.0.0.1:8000/point' 
+        : '/point';
+
+      try {
+        const res = await fetch(`${basePointUrl}?lat=${lat}&lon=${lon}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        if (data.found && data.ndvi !== null) {
+          let badgeColor = '#10b981';
+          let vegLabel = 'Dense Vegetation';
+          if (data.ndvi < 0.0) {
+            badgeColor = '#3b82f6';
+            vegLabel = 'Water / Non-vegetated';
+          } else if (data.ndvi < 0.2) {
+            badgeColor = '#f97316';
+            vegLabel = 'Bare Soil / Sparse';
+          } else if (data.ndvi < 0.5) {
+            badgeColor = '#eab308';
+            vegLabel = 'Moderate Vegetation';
+          }
+
+          inspectionPopup.setContent(`
+            <div style="font-family: 'Inter', sans-serif; padding: 6px; color: #0f172a; min-width: 190px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                <span style="font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b;">EPSG:4326 Sample</span>
+                <span style="background: ${badgeColor}20; color: ${badgeColor}; border: 1px solid ${badgeColor}50; border-radius: 12px; font-size: 0.65rem; font-weight: 700; padding: 2px 6px;">RAW</span>
+              </div>
+              <div style="font-size: 1.45rem; font-weight: 800; color: ${badgeColor}; line-height: 1.1; margin-bottom: 2px;">
+                ${data.ndvi.toFixed(4)}
+              </div>
+              <div style="font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 8px;">
+                ${vegLabel}
+              </div>
+              <div style="font-size: 0.72rem; color: #64748b; border-top: 1px solid #e2e8f0; padding-top: 6px; line-height: 1.5;">
+                <div><strong>Coordinates:</strong> ${lat.toFixed(5)}, ${lon.toFixed(5)}</div>
+                ${data.tile ? `<div><strong>Source Tile:</strong> <code>${data.tile}</code></div>` : ''}
+              </div>
+            </div>
+          `);
+        } else {
+          inspectionPopup.setContent(`
+            <div style="font-family: 'Inter', sans-serif; padding: 6px; color: #0f172a;">
+              <div style="font-size: 0.85rem; font-weight: 700; color: #64748b; margin-bottom: 4px;">No Data</div>
+              <div style="font-size: 0.75rem; color: #94a3b8; margin-bottom: 6px;">Point outside covered raster extent or unmasked water.</div>
+              <div style="font-size: 0.72rem; color: #64748b;">Lat: ${lat.toFixed(5)}, Lon: ${lon.toFixed(5)}</div>
+            </div>
+          `);
+        }
+      } catch (err) {
+        inspectionPopup.setContent(`
+          <div style="font-family: 'Inter', sans-serif; padding: 6px; color: #ef4444;">
+            <div style="font-size: 0.85rem; font-weight: 700;">Query Failed</div>
+            <div style="font-size: 0.75rem; color: #64748b;">${err.message}</div>
+          </div>
+        `);
+      }
+    });
 
   </script>
 </body>

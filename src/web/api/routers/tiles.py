@@ -6,6 +6,7 @@ under the standard XBOA API prefix (/boa/v1/tiles and /boa/v1/cog).
 """
 
 import os
+import json
 from pathlib import Path
 from typing import Optional, Union
 
@@ -186,4 +187,41 @@ async def get_tile_png(
             "Access-Control-Allow-Origin": "*",
         },
     )
+
+
+@tiles_router.get("/point")
+async def inspect_point(
+    lat: float = Query(..., description="Latitude in WGS84 degrees [-90..90]"),
+    lon: float = Query(..., description="Longitude in WGS84 degrees [-180..180]"),
+):
+    """
+    Samples raw NDVI at (lat, lon) directly from EPSG:4326 computation rasters.
+    """
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Coordinate ({lat}, {lon}) out of bounds. Lat in [-90, 90], Lon in [-180, 180].",
+        )
+    engine = get_titiler_engine()
+    try:
+        return await engine.sample_point_async(lat, lon)
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Point sampling error: {err}")
+
+
+@tiles_router.get("/aoi")
+@tiles_router.get("/polygon.json")
+def get_aoi():
+    """Returns the AOI polygon GeoJSON."""
+    candidates = [
+        Path.cwd() / "scripts" / "geo" / "polygon.json",
+        Path(__file__).resolve().parents[4] / "scripts" / "geo" / "polygon.json",
+        Path(__file__).resolve().parents[3] / "scripts" / "geo" / "polygon.json",
+    ]
+    for c in candidates:
+        if c.exists():
+            return json.loads(c.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="AOI polygon file not found")
+
+
 

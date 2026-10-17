@@ -914,3 +914,157 @@ def calculate_display_match_zoom(
     c_equator = INITIAL_RESOLUTION_3857
     z_float = math.log2((c_equator * cos_lat) / (s_comp * tile_size))
     return max(0, min(24, round(z_float)))
+
+
+def point_to_crs84_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
+    """
+    Computes the CRS84 (lat_index, lon_index) grid coordinates for a given (lat, lon) at zoom.
+
+    Grid specification:
+    - Longitude span [-180, +180] -> 2^(zoom + 1) divisions
+    - Latitude span [+90, -90] -> 2^zoom divisions (North is index 0)
+    - Tile angular span = 180.0 / (2^zoom) degrees in both directions.
+
+    Returns:
+        tuple[int, int]: (lat_index, lon_index)
+    """
+    if not (-180.0 <= lon <= 180.0):
+        raise ValueError(f"Longitude out of bounds [-180, 180]: {lon}")
+    if not (-90.0 <= lat <= 90.0):
+        raise ValueError(f"Latitude out of bounds [-90, 90]: {lat}")
+
+    tile_span = 180.0 / (2**zoom)
+    total_lat_steps = 2**zoom
+    total_lon_steps = 2**(zoom + 1)
+
+    lon_idx = int((lon + 180.0) // tile_span)
+    lat_idx = int((90.0 - lat) // tile_span)
+
+    lon_idx = max(0, min(total_lon_steps - 1, lon_idx))
+    lat_idx = max(0, min(total_lat_steps - 1, lat_idx))
+    return lat_idx, lon_idx
+
+
+def sample_crs84_ndvi(
+    raster_dir: Union[str, Path],
+    lat: float,
+    lon: float,
+    zoom: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Samples the exact NDVI pixel value from the EPSG:4326 GeoTIFF tile collection for a given (lat, lon).
+
+    Leverages direct CRS84 grid math (point_to_crs84_tile) to locate the tile file,
+    then samples the raw pixel value using rasterio without any reprojection distortion.
+
+    Returns:
+        dict: {
+            "lat": float,
+            "lon": float,
+            "ndvi": Optional[float],
+            "found": bool,
+            "tile": Optional[str],
+            "crs": "EPSG:4326",
+            "message": Optional[str]
+        }
+    """
+    import re
+    try:
+        import rasterio
+        import numpy as np
+    except ImportError as err:
+        raise ImportError("Missing dependencies for raster sampling: rasterio, numpy") from err
+
+    dir_path = Path(raster_dir)
+    if not dir_path.is_dir():
+        return {
+            "lat": lat,
+            "lon": lon,
+            "ndvi": None,
+            "found": False,
+            "tile": None,
+            "crs": "EPSG:4326",
+            "message": f"Raster directory does not exist: {dir_path}",
+        }
+
+    # Discover zoom level from rasters in directory if not provided
+    if zoom is None:
+        tifs = list(dir_path.glob("ndvi_z*.tif")) + list(dir_path.glob("ndvi_z*.tiff"))
+        if tifs:
+            match = re.search(r"ndvi_z(\d+)_lat", tifs[0].name)
+            zoom = int(match.group(1)) if match else 11
+        else:
+            zoom = 11
+
+    lat_idx, lon_idx = point_to_crs84_tile(lat, lon, zoom)
+    candidate_names = [
+        f"ndvi_z{zoom}_lat{lat_idx}_lon{lon_idx}.tif",
+        f"ndvi_z{zoom}_lat{lat_idx}_lon{lon_idx}.tiff",
+    ]
+
+    target_file = None
+    for name in candidate_names:
+        candidate_path = dir_path / name
+        if candidate_path.exists():
+            target_file = candidate_path
+            break
+
+    # Fallback: if exact tile name not found, check if coordinate falls within any GeoTIFF in directory
+    if target_file is None:
+        all_tifs = sorted(list(dir_path.glob("*.tif")) + list(dir_path.glob("*.tiff")))
+        for tif in all_tifs:
+            try:
+                with rasterio.open(tif) as src:
+                    b = src.bounds
+                    if b.left <= lon <= b.right and b.bottom <= lat <= b.top:
+                        target_file = tif
+                        break
+            except Exception:
+                continue
+
+    if target_file is None:
+        return {
+            "lat": lat,
+            "lon": lon,
+            "ndvi": None,
+            "found": False,
+            "tile": None,
+            "crs": "EPSG:4326",
+            "message": "Point is outside covered raster extent.",
+        }
+
+    with rasterio.open(target_file) as src:
+        b = src.bounds
+        if not (b.left <= lon <= b.right and b.bottom <= lat <= b.top):
+            return {
+                "lat": lat,
+                "lon": lon,
+                "ndvi": None,
+                "found": False,
+                "tile": target_file.name,
+                "crs": "EPSG:4326",
+                "message": "Point is outside covered raster extent.",
+            }
+
+        val = float(next(src.sample([(lon, lat)]))[0])
+        nodata = src.nodata
+
+        if np.isnan(val) or np.isneginf(val) or np.isposinf(val) or (nodata is not None and val == nodata):
+            return {
+                "lat": lat,
+                "lon": lon,
+                "ndvi": None,
+                "found": False,
+                "tile": target_file.name,
+                "crs": "EPSG:4326",
+                "message": "Pixel contains NoData.",
+            }
+
+        return {
+            "lat": lat,
+            "lon": lon,
+            "ndvi": round(val, 4),
+            "found": True,
+            "tile": target_file.name,
+            "crs": "EPSG:4326",
+        }

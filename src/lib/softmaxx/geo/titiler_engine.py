@@ -68,6 +68,7 @@ class TiTilerMetadata:
     bounds_wgs84: Tuple[float, float, float, float]
     ndvi_range: Tuple[float, float]
     supported_cmaps: List[str]
+    comp_storage_path: Optional[str] = None
 
 
 class ThreadSafeTileCache:
@@ -127,6 +128,7 @@ class TiTilerEngine:
     def __init__(
         self,
         storage_path: Union[str, Path],
+        comp_storage_path: Optional[Union[str, Path]] = None,
         dataset_id: str = "COPERNICUS/S2_SR_HARMONIZED",
         cache_size: int = 512,
         default_cmap: str = DEFAULT_CMAP,
@@ -153,9 +155,18 @@ class TiTilerEngine:
                 raise FileNotFoundError(f"No .tif/.tiff files found in {local_dir}")
             self.raster_paths = [str(p) for p in tifs]
 
+        # Resolve EPSG:4326 computation raster directory
+        if comp_storage_path is not None:
+            comp_dir = Path(comp_storage_path).resolve()
+            self.comp_storage_path = comp_dir if comp_dir.is_dir() else None
+        else:
+            sibling_4326 = Path(self.storage_path).parent / "EPSG-4326"
+            self.comp_storage_path = sibling_4326 if sibling_4326.is_dir() else None
+
         logger.info(
             f"TiTilerEngine initialized: storage_type={self.storage_type}, "
-            f"indexed {len(self.raster_paths)} raster(s) at {self.storage_path}"
+            f"indexed {len(self.raster_paths)} display raster(s) at {self.storage_path}, "
+            f"comp_storage_path={self.comp_storage_path}"
         )
 
         # 2. Derive geographic bounds and zoom parameters
@@ -231,6 +242,7 @@ class TiTilerEngine:
             bounds_wgs84=self.bounds_wgs84,
             ndvi_range=(DEFAULT_VMIN, DEFAULT_VMAX),
             supported_cmaps=SUPPORTED_CMAPS,
+            comp_storage_path=str(self.comp_storage_path) if self.comp_storage_path else None,
         )
 
     def render_tile_sync(
@@ -292,4 +304,29 @@ class TiTilerEngine:
         return await asyncio.to_thread(
             self.render_tile_sync, x, y, z, cmap_name, vmin, vmax
         )
+
+    def sample_point(self, lat: float, lon: float) -> dict[str, Any]:
+        """
+        Samples the raw NDVI value at (lat, lon) directly from EPSG:4326 computation rasters.
+        """
+        if self.comp_storage_path is None or not self.comp_storage_path.is_dir():
+            return {
+                "lat": lat,
+                "lon": lon,
+                "ndvi": None,
+                "found": False,
+                "tile": None,
+                "crs": "EPSG:4326",
+                "message": "EPSG:4326 computation raster directory is not configured or available.",
+            }
+        return geo_tiles.sample_crs84_ndvi(
+            raster_dir=self.comp_storage_path,
+            lat=lat,
+            lon=lon,
+        )
+
+    async def sample_point_async(self, lat: float, lon: float) -> dict[str, Any]:
+        """Non-blocking async wrapper around sample_point."""
+        return await asyncio.to_thread(self.sample_point, lat, lon)
+
 

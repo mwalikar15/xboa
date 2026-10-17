@@ -115,6 +115,50 @@ class TestTiTilerServer(unittest.TestCase):
             self.assertEqual(titiler_res.status_code, 200)
             self.assertTrue(titiler_res.content.startswith(b"\x89PNG\r\n\x1a\n"))
 
+            # 7. Point Inspection Endpoint (EPSG:4326 raster sample)
+            pt_res = client.get("/boa/v1/tiles/point?lat=9.80&lon=76.24")
+            self.assertEqual(pt_res.status_code, 200)
+            pt_data = pt_res.json()
+            self.assertTrue(pt_data["found"])
+            self.assertIsNotNone(pt_data["ndvi"])
+            self.assertEqual(pt_data["crs"], "EPSG:4326")
+            self.assertIn("ndvi_z11_lat912_lon2915", pt_data["tile"])
+
+            # 8. Point outside covered extent
+            out_res = client.get("/boa/v1/tiles/point?lat=0.0&lon=0.0")
+            self.assertEqual(out_res.status_code, 200)
+            self.assertFalse(out_res.json()["found"])
+
+            # 9. Invalid coordinates (HTTP 400)
+            bad_res = client.get("/boa/v1/tiles/point?lat=999&lon=0")
+            self.assertEqual(bad_res.status_code, 400)
+
+            # 10. AOI Polygon Endpoint
+            aoi_res = client.get("/boa/v1/tiles/aoi")
+            self.assertEqual(aoi_res.status_code, 200)
+            aoi_data = aoi_res.json()
+            self.assertEqual(aoi_data["type"], "Polygon")
+            self.assertTrue(len(aoi_data["coordinates"][0]) >= 4)
+
+    def test_crs84_point_math_and_sampling(self):
+        # 1. Grid math
+        lat_idx, lon_idx = geo.tiles.point_to_crs84_tile(9.80, 76.24, 11)
+        self.assertEqual(lat_idx, 912)
+        self.assertEqual(lon_idx, 2915)
+
+        # 2. Core library sampling
+        comp_dir = REPO_ROOT / "output" / "rasters" / "EPSG-4326"
+        sample = geo.tiles.sample_crs84_ndvi(comp_dir, 9.80, 76.24)
+        self.assertTrue(sample["found"])
+        self.assertIsInstance(sample["ndvi"], float)
+        self.assertEqual(sample["crs"], "EPSG:4326")
+
+        # 3. Out of bounds sample
+        out_sample = geo.tiles.sample_crs84_ndvi(comp_dir, 0.0, 0.0)
+        self.assertFalse(out_sample["found"])
+        self.assertIsNone(out_sample["ndvi"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

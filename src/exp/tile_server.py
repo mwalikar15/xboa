@@ -38,6 +38,7 @@ import os
 # Ensure matplotlib does not write to non-writable directories
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
+import json
 import logging
 import argparse
 from pathlib import Path
@@ -62,6 +63,7 @@ logger = logging.getLogger("main." + __name__)
 
 def create_titiler_app(
     storage_path: Union[str, Path],
+    comp_storage_path: Optional[Union[str, Path]] = None,
     dataset_id: str = "COPERNICUS/S2_SR_HARMONIZED",
     cache_size: int = 512,
     default_cmap: str = DEFAULT_CMAP,
@@ -72,6 +74,7 @@ def create_titiler_app(
     """
     engine = TiTilerEngine(
         storage_path=storage_path,
+        comp_storage_path=comp_storage_path,
         dataset_id=dataset_id,
         cache_size=cache_size,
         default_cmap=default_cmap,
@@ -173,10 +176,20 @@ def create_titiler_app(
                 "viewer": f"{base_url}/",
                 "health": f"{base_url}/health",
                 "info": f"{base_url}/info",
+                "aoi": f"{base_url}/aoi",
+                "point": f"{base_url}/point?lat={{lat}}&lon={{lon}}",
                 "tile_template": f"{base_url}/tiles/{{z}}/{{x}}/{{y}}.png",
                 "titiler_cog": f"{base_url}/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?url=...",
             },
         }
+
+    @app.get("/aoi")
+    @app.get("/polygon.json")
+    async def get_aoi():
+        poly_file = repo_root / "scripts" / "geo" / "polygon.json"
+        if not poly_file.exists():
+            raise HTTPException(status_code=404, detail="AOI polygon file not found")
+        return json.loads(poly_file.read_text(encoding="utf-8"))
 
     # --------------------------------------------------------------------------
     # Seamless Multi-Raster Dynamic XYZ Tile Endpoint
@@ -240,6 +253,32 @@ def create_titiler_app(
             },
         )
 
+    # --------------------------------------------------------------------------
+    # Point Inspection Endpoint (EPSG:4326 Computation Raster Query)
+    # --------------------------------------------------------------------------
+
+    @app.get("/point")
+    @app.get("/tiles/point")
+    @app.get("/boa/v1/tiles/point")
+    async def inspect_point(
+        lat: float = Query(..., description="Latitude in WGS84 degrees [-90..90]"),
+        lon: float = Query(..., description="Longitude in WGS84 degrees [-180..180]"),
+    ):
+        """
+        Samples the raw NDVI value at (lat, lon) directly from EPSG:4326 GeoTIFF rasters.
+        Web map renders in EPSG:3857, while user clicks query EPSG:4326 for scientific accuracy.
+        """
+        if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Coordinate ({lat}, {lon}) out of bounds. Lat in [-90, 90], Lon in [-180, 180].",
+            )
+        try:
+            return await engine.sample_point_async(lat, lon)
+        except Exception as err:
+            logger.exception(f"Error sampling point at ({lat}, {lon}): {err}")
+            raise HTTPException(status_code=500, detail="Error sampling point")
+
     return app
 
 
@@ -247,6 +286,7 @@ def run_tile_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     storage_path: Optional[Union[str, Path]] = None,
+    comp_storage_path: Optional[Union[str, Path]] = None,
     dataset_id: str = "COPERNICUS/S2_SR_HARMONIZED",
     cache_size: int = 512,
     default_cmap: str = DEFAULT_CMAP,
@@ -280,8 +320,15 @@ def run_tile_server(
             "Run ndvi_downloader.py first, or pass --storage-path explicitly."
         )
 
+    # Discover default local computation raster directory (EPSG-4326) if not provided
+    if comp_storage_path is None:
+        comp_candidate = repo_root / "output" / "rasters" / "EPSG-4326"
+        if comp_candidate.is_dir() and (list(comp_candidate.glob("*.tif")) or list(comp_candidate.glob("*.tiff"))):
+            comp_storage_path = comp_candidate
+
     app = create_titiler_app(
         storage_path=storage_path,
+        comp_storage_path=comp_storage_path,
         dataset_id=dataset_id,
         cache_size=cache_size,
         default_cmap=default_cmap,
@@ -295,10 +342,12 @@ def run_tile_server(
     logger.info(f"  Web Map Viewer        : {base_url}/")
     logger.info(f"  Health Check          : {base_url}/health")
     logger.info(f"  Tile Metadata (/info) : {base_url}/info")
+    logger.info(f"  Point Query (/point)  : {base_url}/point?lat={{lat}}&lon={{lon}}")
     logger.info(f"  Seamless Tile Layer   : {base_url}/tiles/{{z}}/{{x}}/{{y}}.png")
     logger.info(f"  TiTiler COG Endpoint  : {base_url}/cog/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?url=...")
     logger.info("-" * 75)
-    logger.info(f"  Storage Backend       : {meta.storage_type.upper()} ({meta.storage_path})")
+    logger.info(f"  Display Backend (3857): {meta.storage_type.upper()} ({meta.storage_path})")
+    logger.info(f"  Computation (4326)    : {meta.comp_storage_path or 'Not configured'}")
     logger.info(f"  GEE Dataset ID        : {meta.dataset_id}")
     logger.info(f"  Native Res (s_comp)   : {meta.s_comp_meters} m/pixel (Dynamic from GEE)")
     logger.info(f"  Container Native Zoom : Z={meta.native_zoom} (from calculate_web_map_tile_zoom)")
@@ -341,6 +390,13 @@ def _parse_args() -> argparse.Namespace:
         help="Directory containing EPSG:3857 GeoTIFF rasters, or an S3 URI (s3://bucket/prefix).",
     )
     parser.add_argument(
+        "--comp-storage-path",
+        "--comp-dir",
+        dest="comp_storage_path",
+        default=None,
+        help="Directory containing EPSG:4326 GeoTIFF rasters for computation.",
+    )
+    parser.add_argument(
         "--dataset-id",
         type=str,
         default="COPERNICUS/S2_SR_HARMONIZED",
@@ -367,6 +423,7 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         storage_path=args.storage_path,
+        comp_storage_path=args.comp_storage_path,
         dataset_id=args.dataset_id,
         cache_size=args.cache_size,
         default_cmap=args.cmap,
